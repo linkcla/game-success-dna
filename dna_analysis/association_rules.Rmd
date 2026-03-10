@@ -1,0 +1,184 @@
+```{r, include=FALSE}
+library(tidyverse)
+library(dplyr)
+library(ggrepel)
+library(scales)
+library(arules)
+library(arulesViz)
+```
+
+```{r}
+df_clusters <- read_csv("../data/clustering.csv")
+source("../scripts/cleaning_pipeline.R", chdir = TRUE)
+
+df_clean <- df_final |> 
+  select(appid, genres, windows, mac, linux, required_age, has_violence, 
+         has_gore, has_nudity_sexual, has_horror, has_gambling)
+df <- merge(df_clusters, df_clean, by = "appid", all.x = TRUE)
+```
+
+
+
+```{r}
+# Create transactions list by simplifying the genres column
+transactions_list <- lapply(1:nrow(df), function(i) {
+  mis_genres <- df$genres[[i]]
+  mi_cluster <- paste0("Cluster=", df$cluster_final[i])
+  items <- c(mis_genres, mi_cluster)
+  return(items[!is.na(items) & items != ""])
+})
+
+# Convert the dataset to a transactions list
+trans <- as(transactions_list, "transactions")
+
+# Add a prefix to clusers name
+nombres_clusters <- grep("Cluster=", itemLabels(trans), value = TRUE)
+```
+
+
+```{r}
+rules <- apriori(trans, 
+                  parameter = list(
+                    supp = 0.001,
+                    conf = 0.1, 
+                    minlen = 2,
+                    maxlen = 5
+                  ),
+                  appearance = list(rhs = nombres_clusters, default = "lhs"))
+
+rules_ordenadas <- sort(rules, by = "lift")
+inspect(head(rules_ordenadas, 15))
+```
+
+
+```{r}
+reglas <- apriori(trans, 
+                  parameter = list(supp = 0.001, conf = 0.1, minlen = 2, maxlen = 4),
+                  control = list(verbose = FALSE),
+                  appearance = list(rhs = nombres_clusters, default = "lhs"))
+
+# Filter rules with a minimun count
+rules_top <- subset(rules, count > 2) 
+
+rules_top <- sort(rules_top, by = "lift", decreasing = TRUE)
+
+inspect(rules_top)
+```
+
+
+
+```{r}
+# Apriori with all clusters
+rules_totales <- apriori(trans, 
+                  parameter = list(supp = 0.001, conf = 0.1, minlen = 2, maxlen = 4),
+                  control = list(verbose = FALSE),
+                  appearance = list(rhs = nombres_clusters, default = "lhs"))
+# Remove redundant rules. For example: {Action, Indie} -> A and {Action} -> A
+rules_totales <- rules_totales[!is.redundant(rules_totales)]
+
+# Function to get the n-top rules for a given cluster and metric
+get_top_rules <- function(mis_rules, cluster_name, metric_sort = "lift", n = 3) {
+  
+  subset_rules <- subset(mis_rules, rhs %in% paste0("Cluster=", cluster_name))
+  subset_rules <- sort(subset_rules, by = metric_sort, decreasing = TRUE)
+  top <- head(subset_rules, n)
+  
+  return(as(top, "data.frame"))
+}
+
+# --- ANALYSIS BY GROUP ---
+
+# A. For special gruops we sort by lift, what makes them uniques?
+topn = 3
+for(i in unique(df$cluster_final)) {
+  print(paste0("--- TOP Rules : Cluster=", i, " ---"))
+  print(get_top_rules(rules_totales, i, metric_sort = "lift", n = topn))
+}
+```
+
+```{r}
+# Select the best global rules ordered by lift
+top_rules_viz <- head(sort(rules_totales, by = "lift"), 50)
+
+plot(top_rules_viz, method = "grouped")
+```
+
+
+```{r}
+# Instead of count > 2 let us restrict more the rules frequency
+min_juegos_para_patron <- 10
+
+important_rules <- subset(rules_totales, 
+                          count >= min_juegos_para_patron & 
+                          lift > 1.2) # To have some importance
+
+# Now we order rules by lift but now we know that they are important
+inspect(sort(important_rules, by = "lift"))
+
+for(i in sort(unique(df$cluster_final))) {
+  print(get_top_rules(important_rules, i, metric_sort = "lift", n = 5))
+}
+```
+
+See if we can generate association rules to describe the clusters based on the age restrictions and content warnings
+
+```{r}
+restrictions_df <- df %>% select(required_age, has_violence, has_gore, has_nudity_sexual, has_horror, has_gambling, cluster_final)
+
+restrictions_df <- restrictions_df %>% 
+  mutate(public_objective = case_when(
+    required_age >= 18 ~ "ADULT",      
+    required_age >= 13 ~ "TEENAGER",
+    TRUE ~ "ALL"                      
+  ))
+```
+
+```{r}
+df_tmp <- restrictions_df
+cols_bool <- c("has_violence", "has_gore", "has_nudity_sexual", "has_horror", "has_gambling")
+
+df_tmp$bool_tags <- apply(df_tmp[, cols_bool], 1, function(row) {
+  row <- as.logical(row)
+  paste(cols_bool[row], collapse = ",")
+})
+
+df_tmp$full_string <- paste(
+  df_tmp$bool_tags,
+  df_tmp$public_objective,
+  paste0("Cluster=", df_tmp$cluster_final),
+  sep = ","
+)
+
+items_list <- strsplit(df_tmp$full_string, ",")
+items_list <- lapply(items_list, trimws)
+items_list <- lapply(items_list, function(x) x[x != ""])
+```
+
+
+```{r}
+warning_transactions <- as(items_list, "transactions")
+
+warning_rules <- apriori(warning_transactions, 
+                  parameter = list(
+                    supp = 0.001,
+                    conf = 0.1, 
+                    minlen = 2,
+                    maxlen = 5
+                  ),
+                  appearance = list(rhs = nombres_clusters, default = "lhs"))
+
+ordered_rules <- sort(warning_rules, by = "lift")
+inspect(head(ordered_rules, 15))
+```
+
+```{r}
+
+for(i in 1:7) {
+  print(get_top_rules(warning_rules, i, n = 5))
+}
+```
+
+
+
+
+

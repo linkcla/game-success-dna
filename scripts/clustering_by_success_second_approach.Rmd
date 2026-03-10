@@ -1,0 +1,723 @@
+```{r, include=FALSE}
+library(tidyverse)
+library(ggrepel)
+library(scales)
+library(umap)
+library(GGally)
+library(dplyr)
+library(ggplot2)
+library(corrplot)
+library(factoextra)
+library(clustertend)
+library(plotly)
+```
+
+```{r}
+source("cleaning_pipeline.R")
+
+scrapdb <- read_csv("./../scraping/steamdb_top_peaks_cleaned.csv") |>
+  rename(c(
+    "all_time_peak" = "All-Time Peak", "24h_peak" = "24h Peak",
+    "name" = "Name"
+  ))
+
+df_final <- merge(df_final, scrapdb |> select(-all_of("name")), by = "appid", all.x = TRUE) |>
+  filter(!is.na(all_time_peak))
+```
+
+Queremos estudiar que determina el comportamiento exitoso de un juego, para ello en vez de nosotros determinar que es éxito, dejaremos que los datos nos lo digan mediante la aplicación de técnicas de clúster sobre datos de rendimiento.
+
+Para ello vamos a determinar de nuestro dataset cuáles son las columnas que nos dan información el rendimiento que ha tenido el juego una vez se ha lanzado al mercado.
+```{r}
+performance_cols <- c(
+  "median_playtime_forever", "median_playtime_2weeks",
+  "recommendations", "owners_avg", "total_positive",
+  "total_reviews", "num_tag_association", "all_time_peak", "days_since_release"
+)
+```
+
+Antes de nada, sabemos que los métodos de clustering son bastante sensibles a outliers. Por este motivo vamos a estudiar si hay juegos que son outliers analizando las variables seleccionadas. Primero empezamos mirando las variables con la que podemos destiguir si hay outliers generados por juegos en los que ponen bots a jugar para ganar cromos coleccionables que después se pueden vender. Por este motivo, no nos interesa meter estos juegos en el estudio de el éxito ya que lo que nos harán será distorsinar los análisis.
+```{r, fig.height=20, fig.width=20, warning=FALSE, echo=FALSE}
+cols_playtime <- performance_cols
+
+# 1. Preparación de datos y Detección de Outliers
+data_plot <- df_final |>
+  select(name, all_of(cols_playtime)) |>
+  pivot_longer(cols = all_of(cols_playtime), names_to = "metrica", values_to = "valor") |>
+  filter(valor > 0) |>
+  group_by(metrica) |>
+  mutate(
+    # Cálculos del Boxplot
+    Q1 = quantile(valor, 0.25),
+    Q3 = quantile(valor, 0.75),
+    IQR = Q3 - Q1,
+    upper_limit = Q3 + 1.5 * IQR,
+
+    # Identificar outliers
+    is_outlier = valor > upper_limit
+  ) |>
+  # Ranking interno: Ordenamos los outliers del más grande al más pequeño
+  arrange(metrica, desc(valor)) |>
+  mutate(
+    ranking_outlier = row_number(),
+    # TRUCO VISUAL: Solo creamos etiqueta si es outlier Y está en el Top 10
+    label_text = ifelse(is_outlier & ranking_outlier <= 10, name, NA)
+  ) |>
+  ungroup()
+
+# 2. Generación del Gráfico
+ggplot(data_plot, aes(x = metrica, y = valor)) +
+
+  # A. Puntos Normales (Azules, con jitter para ver densidad)
+  geom_jitter(
+    data = filter(data_plot, !is_outlier),
+    color = "#b3cde0", alpha = 0.3, width = 0.2
+  ) +
+
+  # B. Puntos Outliers (Rojos, SIN jitter para que la flecha apunte bien)
+  geom_point(
+    data = filter(data_plot, is_outlier),
+    color = "#d9534f", alpha = 0.6, size = 1.5
+  ) +
+
+  # C. Cajas del Boxplot (Transparente encima)
+  geom_boxplot(fill = NA, color = "#2c3e50", outlier.shape = NA, width = 0.5) +
+
+  # D. Etiquetas (SOLO para el Top 10 extremos, para no crear el desastre rojo)
+  geom_text_repel(
+    aes(label = label_text),
+    size = 3,
+    color = "#c0392b", # Rojo oscuro
+    fontface = "bold",
+    min.segment.length = 0, # Siempre línea
+    box.padding = 0.5,
+    max.overlaps = Inf, # Forzamos que salgan los 10 sí o sí
+    nudge_x = 0.5, # Empujamos etiquetas a la derecha
+    direction = "y" # Preferencia vertical
+  ) +
+
+  # E. Escalas y Diseño
+  facet_wrap(~metrica, scales = "free", ncol = 3) +
+  theme_minimal() +
+  labs(
+    title = "Distribución de Playtime: Top 10 Outliers Etiquetados",
+    subtitle = "Los puntos rojos son outliers (según boxplot). Solo se etiquetan los 10 más extremos para legibilidad.",
+    y = "",
+    x = ""
+  ) +
+  theme(
+    axis.text.x = element_blank(),
+    strip.text = element_text(face = "bold", size = 11)
+  )
+```
+Con este gráfico podemos ver que hay medidas desorbitadas tanto en 'median_paytime_2weeks' como en 'median_playtime_forever. Estos lo más seguro es que sean juegos de farmeo donde juegan los bots por las personas (casos como: LoveKami, A Sky Full of Stars, Hatsune Miku VR NEKOPARA, ...) para obtener trading cards y posteriormente venderlas en el mercado de Steam.
+
+En el resto de boxplots, podemos ver que los juegos que estan arriba del todo son juegos realmente exitosos y famosos, así que estos no los podemos eliminar y lo que haremos será pasar estas variables a escala logaritmica para que la distancia no sea tan lejana y nos permita diferenciar más entre los que no son tan famosos o no han tenido tanto éxito.
+
+# Detectar y arreglar outliers
+
+Entonces vamos en enfocarnos en detectar y arreglar los outliers que observamos con las variables 'median_playtime_2weeks' y 'median_playtime_forever'. Para no detectar y eliminar los outliers mediante un cuantil o mediante un threshold inventado, lo que haremos será aplicar el método de clustering k-means para que nos separe estos dos grupos tan diferenciados. Por esto usaremos k=2:
+```{r clustering, echo=FALSE}
+# 1. Selección EXCLUSIVA de variables de tiempo
+# Tu intuición es correcta: aislamos el problema.
+time_cols <- c("median_playtime_forever", "median_playtime_2weeks")
+
+df_time_cluster <- df_final %>%
+  select(all_of(time_cols))
+
+# 2. PROCESAMIENTO
+# Aquí hay un matiz importante:
+# Como la diferencia es TAN bestia (5.000 vs 1.000.000),
+# PODRÍAMOS no usar logaritmo para que la distancia bruta separe los grupos.
+# Pero para ser rigurosos y que el algoritmo converja bien, escalamos.
+df_time_scaled <- df_time_cluster %>%
+  mutate(across(everything(), scale))
+
+# 3. K-MEANS CON K=2 (Normal vs Anormal)
+set.seed(8)
+kmeans_time <- kmeans(df_time_scaled, centers = 2, nstart = 25)
+
+# 4. Asignamos y revisamos
+df_final$cluster_time <- as.factor(kmeans_time$cluster)
+
+# 5. VERIFICACIÓN: ¿Qué ha capturado cada grupo?
+resumen_limpieza <- df_final %>%
+  group_by(cluster_time) %>%
+  summarise(
+    Total_Juegos = n(),
+    Min_MedianPlaytimeF = min(median_playtime_forever, na.rm = T),
+    Max_MedianPlaytimeF = max(median_playtime_forever, na.rm = T),
+    Avg_MedianPlaytimeF = mean(median_playtime_forever, na.rm = T),
+    Min_MedianPlaytime2W = min(median_playtime_2weeks, na.rm = T),
+    Max_MedianPlaytime2W = max(median_playtime_2weeks, na.rm = T),
+    Avg_MedianPlaytime2W = mean(median_playtime_2weeks, na.rm = T),
+    Ejemplos = paste(head(name, 3), collapse = ", ") # Para ver nombres
+  ) %>%
+  arrange(desc(Avg_MedianPlaytimeF))
+
+print(resumen_limpieza)
+```
+Aqui con los máximos y las medias de los elementos de cada uno de los clusters podemos ver que hay una diferencia muy grande entre grupos.
+Veamoslo en un plot:
+```{r, echo=FALSE}
+# 6. VISUALIZACIÓN RÁPIDA
+ggplot(df_final, aes(x = median_playtime_forever, y = median_playtime_2weeks, color = cluster_time)) +
+  geom_point(alpha = 0.5) +
+  geom_text_repel(data = subset(df_final, cluster_time == 1), aes(label = name), show.legend = FALSE) +
+  theme_minimal() +
+  labs(
+    title = "Bot detection by playtime"
+  )
+```
+
+Ahora a simple vista podemos ver el k-means ha conseguido separar en dos grupos, unos que tienen unos valores de variables desorbitados y los otros que parecen tener un comportamiento más natural y humano. Por este motivo, nos quedaremos con los juegos que pertenecen al cluster_time = 2, y eliminaremos estos outliers que nos estarian dañando el target de éxito.
+
+```{r}
+df_final <- df_final |> filter(cluster_time == 2)
+```
+
+Ahora vamos a volver a analizar como han quedado los boxplot de nuevo:
+
+```{r, fig.height=20, fig.width=20, warning=FALSE, echo=FALSE}
+cols_playtime <- performance_cols
+
+# 1. Preparación de datos y Detección de Outliers
+data_plot <- df_final |>
+  select(name, all_of(cols_playtime)) |>
+  pivot_longer(cols = all_of(cols_playtime), names_to = "metrica", values_to = "valor") |>
+  filter(valor > 0) |>
+  group_by(metrica) |>
+  mutate(
+    # Cálculos del Boxplot
+    Q1 = quantile(valor, 0.25),
+    Q3 = quantile(valor, 0.75),
+    IQR = Q3 - Q1,
+    upper_limit = Q3 + 1.5 * IQR,
+
+    # Identificar outliers
+    is_outlier = valor > upper_limit
+  ) |>
+  # Ranking interno: Ordenamos los outliers del más grande al más pequeño
+  arrange(metrica, desc(valor)) |>
+  mutate(
+    ranking_outlier = row_number(),
+    # TRUCO VISUAL: Solo creamos etiqueta si es outlier Y está en el Top 10
+    label_text = ifelse(is_outlier & ranking_outlier <= 10, name, NA)
+  ) |>
+  ungroup()
+
+# 2. Generación del Gráfico
+ggplot(data_plot, aes(x = metrica, y = valor)) +
+
+  # A. Puntos Normales (Azules, con jitter para ver densidad)
+  geom_jitter(
+    data = filter(data_plot, !is_outlier),
+    color = "#b3cde0", alpha = 0.3, width = 0.2
+  ) +
+
+  # B. Puntos Outliers (Rojos, SIN jitter para que la flecha apunte bien)
+  geom_point(
+    data = filter(data_plot, is_outlier),
+    color = "#d9534f", alpha = 0.6, size = 1.5
+  ) +
+
+  # C. Cajas del Boxplot (Transparente encima)
+  geom_boxplot(fill = NA, color = "#2c3e50", outlier.shape = NA, width = 0.5) +
+
+  # D. Etiquetas (SOLO para el Top 10 extremos, para no crear el desastre rojo)
+  geom_text_repel(
+    aes(label = label_text),
+    size = 3,
+    color = "#c0392b", # Rojo oscuro
+    fontface = "bold",
+    min.segment.length = 0, # Siempre línea
+    box.padding = 0.5,
+    max.overlaps = Inf, # Forzamos que salgan los 10 sí o sí
+    nudge_x = 0.5, # Empujamos etiquetas a la derecha
+    direction = "y" # Preferencia vertical
+  ) +
+
+  # E. Escalas y Diseño
+  facet_wrap(~metrica, scales = "free", ncol = 2) +
+  theme_minimal() +
+  labs(
+    title = "Distribución de Playtime: Top 10 Outliers Etiquetados",
+    subtitle = "Los puntos rojos son outliers (según boxplot). Solo se etiquetan los 10 más extremos para legibilidad.",
+    y = "Tiempo (Minutos - Log Scale)",
+    x = ""
+  ) +
+  theme(
+    axis.text.x = element_blank(),
+    strip.text = element_text(face = "bold", size = 11)
+  )
+```
+```{r, echo=FALSE}
+ggplot(df_final, aes(x = median_playtime_forever, y = median_playtime_2weeks)) +
+  geom_point(alpha = 0.5) +
+  theme_minimal() +
+  labs(
+    title = "Visualizar la distribución por tiempo jugado",
+  )
+```
+Con los plots anteriores ya podemos observar que los datos pueden seguir comportamientos más normales pero que sigue habiendo diferentes grupos.
+
+# Transformar variables a escala logaritmica
+Lo siguiente que debemos hacer transformar los datos a escala logaritmica ya que sus distribuciones son exponenciales. De esta manera acercaremos las distancias de estos juegos que estan tan alejados del promedio. De esta manera los modelos podran diferenciar y no se veran tan sesgados por la escala de los juegos últa exitosos como el 'Counter Strike 2' o 'Dota 2' entre otros.
+
+```{r}
+new_log_cols <- paste0(performance_cols, "_log")
+
+
+df_performance_log <- df_final %>%
+  mutate(
+    across(
+      .cols = all_of(performance_cols),
+      .fns = log1p,
+      .names = "{.col}_log"
+    )
+  ) |>
+  select(all_of(c("appid", "name", "days_since_release", new_log_cols)))
+print(colnames(df_performance_log))
+```
+
+
+
+Una vez hecho la escala logaritmica vamos a ver como han quedado los boxplots:
+```{r, fig.height=5, fig.width=8, warning=FALSE, echo=FALSE}
+cols <- c(
+  "recommendations_log", "owners_avg_log", "total_positive_log",
+  "total_reviews_log", "num_tag_association_log",
+  "median_playtime_forever_log", "median_playtime_2weeks_log",
+  "all_time_peak_log", "days_since_release"
+)
+
+# 1. Preparación de datos y Detección de Outliers
+data_plot <- df_performance_log |>
+  select(name, all_of(cols)) |>
+  pivot_longer(cols = all_of(cols), names_to = "metrica", values_to = "valor") |>
+  filter(valor > 0) |>
+  group_by(metrica) |>
+  mutate(
+    # Cálculos del Boxplot
+    Q1 = quantile(valor, 0.25),
+    Q3 = quantile(valor, 0.75),
+    IQR = Q3 - Q1,
+    upper_limit = Q3 + 1.5 * IQR,
+
+    # Identificar outliers
+    is_outlier = valor > upper_limit
+  ) |>
+  # Ranking interno: Ordenamos los outliers del más grande al más pequeño
+  arrange(metrica, desc(valor)) |>
+  mutate(
+    ranking_outlier = row_number(),
+    # TRUCO VISUAL: Solo creamos etiqueta si es outlier Y está en el Top 10
+    label_text = ifelse(is_outlier & ranking_outlier <= 10, name, NA)
+  ) |>
+  ungroup()
+
+# 2. Generación del Gráfico
+ggplot(data_plot, aes(x = metrica, y = valor)) +
+
+  # A. Puntos Normales (Azules, con jitter para ver densidad)
+  geom_jitter(
+    data = filter(data_plot, !is_outlier),
+    color = "#b3cde0", alpha = 0.3, width = 0.2
+  ) +
+
+  # B. Puntos Outliers (Rojos, SIN jitter para que la flecha apunte bien)
+  geom_point(
+    data = filter(data_plot, is_outlier),
+    color = "#d9534f", alpha = 0.6, size = 1.5
+  ) +
+
+  # C. Cajas del Boxplot (Transparente encima)
+  geom_boxplot(fill = NA, color = "#2c3e50", outlier.shape = NA, width = 0.5) +
+
+  # D. Etiquetas (SOLO para el Top 10 extremos, para no crear el desastre rojo)
+
+  # E. Escalas y Diseño
+  facet_wrap(~metrica, scales = "free", ncol = 3) +
+  theme_minimal() +
+  labs(
+    title = "Distribution of performance variables",
+    y = "",
+    x = ""
+  ) +
+  theme(
+    axis.text.x = element_blank(),
+    strip.text = element_text(face = "bold", size = 11)
+  )
+```
+Ahora bastante mejor, los valores estan más centrados y cerca entre si.
+
+# Normalizar variables acumulativas por antiguedad
+En este punto, hemos decidido **no dividir por la antigüedad** (`days_since_release`). Al dividir variables logarítmicas por una variable de tiempo que tiene gran varianza, se introduce una correlación espuria (todos los ratios comparten el mismo denominador), lo que distorsiona el PCA y el clustering.
+Utilizaremos las variables en **escala logarítmica absoluta** para medir la magnitud del éxito, independientemente del tiempo.
+
+```{r}
+df_performance <- df_performance_log |>
+  select(
+    appid, name, days_since_release, median_playtime_forever_log, median_playtime_2weeks_log,
+    recommendations_log, owners_avg_log, total_positive_log,
+    total_reviews_log, num_tag_association_log, all_time_peak_log
+  )
+```
+
+Ahora hemos podido diferenciar estos dos comportamientos, seleccionado el que queremos estudiar y generado las nuevas métricas para disminuir el sesgo por antiguedad. Vamos a ver de las variables 'performance' seleccionadas cuales estan correlacionadas para eliminarlas/transformarlas con el objetivo de reducir al máximo la multicolinealidad.
+```{r, fig.width=10, echo=FALSE}
+cor_matrix <- cor(df_performance |> select(-all_of(c("appid", "name"))))
+
+corrplot(cor_matrix,
+  method = "color",
+  type = "upper", # Solo la mitad superior (la otra es espejo)
+  order = "hclust", # Agrupa las variables parecidas juntas
+  addCoef.col = "black", # Muestra el número
+  tl.col = "black", # Color del texto
+  tl.srt = 45, # Rotación del texto
+)
+```
+
+Aquí hay dos grupos, un grupo descorrelacionado y otro con correlación casi perfecta.
+- El grupo descorrelacionado es el que tiene que ver con las medidas de tiempo promedio jugado por usuario y el pico máximo de jugadores. Estas varibales las conservaremos y nos ayudaran a medir la retencion, el engagement y lo famoso que ha llegado a ser en cierto punto.
+- Variables casi perfectamentes correlacionadas. Con la transformación logaritmica hemos descubierto que en terminos de tasa de crecimiento, la adquisición de dueños y la recepción de feedback son una unica dimesión dada la correlación. Si un juego crece rápido en ventas también lo hará en reseñas.
+
+# Comprobación de Linealidad
+Antes de proceder, verificamos si las relaciones entre las variables altamente correlacionadas son lineales. Una correlación alta de Pearson implica linealidad, pero una inspección visual nos confirmará si no hay relaciones curvas ocultas.
+
+```{r, fig.height=10, fig.width=10}
+# Variables correlacionadas a inspeccionar
+corr_vars <- c("total_positive_log", "total_reviews_log", "owners_avg_log", "recommendations_log")
+
+# Matriz de dispersión (Pairs Plot)
+pairs(df_performance[, corr_vars],
+  pch = 19, col = alpha("blue", 0.4),
+  lower.panel = panel.smooth, # Muestra línea de suavizado para ver curvas
+  upper.panel = NULL,
+  main = "Check de Linealidad: Variables de Popularidad"
+)
+```
+Si las líneas rojas (suavizado) son rectas, la relación es lineal y PCA es perfecto. Si hay curvas, la correlación de Pearson podría estar subestimando la relación, pero dado que ya aplicamos logaritmos, esperamos líneas bastante rectas.
+
+# Selección de Variables y Feature Engineering (PCA Parcial)
+Como confirmamos la alta redundancia y linealidad en el bloque de "Popularidad", usamos PCA para condensar estas 4 variables en una sola dimensión llamada `popularity_index`.
+
+```{r}
+# 1. PCA Parcial para Popularidad
+pca_pop_data <- df_performance |>
+  select(all_of(corr_vars))
+
+# Calculamos PCA (escalando)
+pca_pop <- prcomp(pca_pop_data, scale. = TRUE, center = TRUE)
+
+summary(pca_pop)
+pca_pop$rotation # Ver cargas
+```
+La primera componente (PC1) explica gran parte de la varianza. La usaremos como nuestro índice. OJO: Los signos de PCA son arbitrarios. Si las cargas son negativas, multiplicaremos por -1 para que "más valor" signifique "más popularidad".
+
+```{r}
+# Extraemos PC1
+popularity_score <- pca_pop$x[, 1]
+
+# Verificamos la dirección (queremos correlación positiva con reviews)
+if (cor(popularity_score, df_performance$total_reviews_log) < 0) {
+  popularity_score <- popularity_score * -1
+}
+
+# Añadimos al dataframe
+df_performance$popularity_index <- popularity_score
+```
+
+Nos quedaremos con 5 variables finales para el clustering (sustituyendo el bloque correlacionado por el índice):
+- **median_playtime_forever_log**: Retención (histórica).
+- **median_playtime_2weeks_log**: Engagement (reciente).
+- **all_time_peak_log**: Alcance Máximo (viralidad).
+- **popularity_index**: Popularidad General (PCA de ventas, reviews, recomendaciones).
+- **days_since_release**: Antigüedad (contexto temporal).
+
+```{r}
+df_cluster_ready <- df_performance |>
+  select(
+    appid, name,
+    median_playtime_forever_log,
+    median_playtime_2weeks_log,
+    all_time_peak_log,
+    popularity_index,
+    days_since_release,
+    num_tag_association_log
+  )
+
+# Mostramos cabecera
+head(df_cluster_ready)
+```
+
+
+
+# 1. Normalización de Datos
+Como vamos a utilizar métodos de distancia (Euclídea), es imperativo escalar todas las variables.
+
+```{r}
+# Definimos nuestro dataset final de trabajo
+df_performance_final <- df_cluster_ready
+
+# Identificamos columnas numéricas (excluyendo id y name)
+numeric_cols <- names(df_performance_final)[!names(df_performance_final) %in% c("appid", "name")]
+
+# Escalado (mean=0, sd=1)
+df_scaled_matrix <- df_performance_final |>
+  select(all_of(numeric_cols)) |>
+  scale()
+
+df_scaled <- as.data.frame(df_scaled_matrix)
+df_scaled$appid <- df_performance_final$appid
+df_scaled$name <- df_performance_final$name
+
+# Verificamos
+head(df_scaled)
+```
+
+# 2. UMAP para Visualización en 3D
+En lugar de PCA, utilizaremos UMAP (Uniform Manifold Approximation and Projection) para reducir las dimensiones a 3 para la visualización. UMAP preserva mejor la estructura local y global de los datos en comparación comp PCA, permitiendo ver clusters no lineales.
+
+```{r}
+set.seed(123)
+# Configuración de UMAP
+umap_config <- umap.defaults
+umap_config$n_components <- 3
+umap_config$n_neighbors <- 15
+umap_config$min_dist <- 0.1
+
+# Calculamos UMAP
+umap_fit <- umap(df_scaled_matrix, config = umap_config)
+
+# Extraemos las coordenadas
+df_umap_3d <- as.data.frame(umap_fit$layout)
+colnames(df_umap_3d) <- c("UMAP1", "UMAP2", "UMAP3")
+
+# Añadimos info básica para tooltips en plots
+df_vis <- cbind(df_performance_final %>% select(appid, name), df_umap_3d)
+
+summary(df_umap_3d)
+```
+Ahora tenemos las coordenadas UMAP para visualizar nuestros clusters en 3D.
+
+Como vemos en el summary de UMAP, tenemos las coordenadas proyectadas. No hay "varianza explicada" simple como en PCA, pero podemos ver la estructura.
+Vamos a realizar el test de Hopkins para ver si los datos tienden a estar agrupados.
+
+```{r}
+set.seed(123)
+datos_para_hopkins <- df_scaled[sample(nrow(df_scaled), 2000), ]
+
+# Calculamos el estadístico
+# Usamos n=1000 para reducir la carga computacional.
+res_hopkins <- get_clust_tendency(datos_para_hopkins, n = 1000, graph = FALSE)
+
+print(res_hopkins$hopkins_stat)
+```
+Este valor de 0.9467 nos indica que los datos si que tienen a agruparse y no seguir una distribución uniforme.
+
+```{r}
+# Vamos a probar 3 configuraciones más estrictas
+valores_eps <- c(0.35, 0.4, 0.45, 0.5)
+minPts_value <- 10 # Subimos un poco la exigencia de densidad
+
+for (e in valores_eps) {
+  set.seed(123)
+  db_test <- dbscan(df_scaled, eps = e, minPts = minPts_value)
+
+  cat("\n--------------------------------\n")
+  cat("PRUEBA con eps =", e, "| minPts =", minPts_value, "\n")
+  print(table(db_test$cluster))
+}
+```
+Nos quedamos con eps=0.35 y minPts=10
+
+```{r}
+# Fijamos el modelo ganador
+set.seed(123)
+db_final_dbscan <- dbscan(df_scaled_matrix, eps = 0.5, minPts = 10)
+
+# Asignamos los clusters al dataframe visual y al final
+df_performance_final$cluster_dbscan <- as.factor(db_final_dbscan$cluster)
+df_vis$cluster_dbscan <- as.factor(db_final_dbscan$cluster)
+```
+
+```{r}
+# Resumen estadístico por cluster
+perfil_clusters <- df_performance_final %>%
+  group_by(cluster_dbscan) %>%
+  summarise(
+    Count = n(),
+    Avg_Days = mean(days_since_release, na.rm = TRUE),
+    Avg_Playtime_F_Log = mean(median_playtime_forever_log, na.rm = TRUE),
+    Avg_Popularity_Index = mean(popularity_index, na.rm = TRUE),
+    Avg_Peak_Log = mean(all_time_peak_log, na.rm = TRUE),
+    # Mostramos algunos ejemplos
+    Examples = paste(head(name, 2), collapse = ", ")
+  ) %>%
+  arrange(desc(Avg_Popularity_Index))
+
+print(perfil_clusters)
+```
+
+```{r}
+plot_ly(df_vis,
+  x = ~UMAP1,
+  y = ~UMAP2,
+  z = ~UMAP3,
+  color = ~cluster_dbscan,
+  colors = mis_colores,
+  type = "scatter3d",
+  mode = "markers",
+  text = ~name,
+  hovertemplate = paste(
+    "<b>%{text}</b><br>",
+    "Cluster: %{marker.color}<br>",
+    "<extra></extra>"
+  ),
+  marker = list(size = 3, opacity = 0.7)
+) %>%
+  layout(
+    title = "Clustering DBSCAN (Proyección UMAP)",
+    scene = list(
+      xaxis = list(title = "UMAP1"),
+      yaxis = list(title = "UMAP2"),
+      zaxis = list(title = "UMAP3")
+    )
+  )
+```
+
+```{r}
+# --- APLICAMOS GMM AQUÍ ---
+library(mclust)
+set.seed(123)
+gmm_active <- Mclust(df_scaled_matrix)
+
+df_gmm <- as.data.frame(df_scaled)
+
+# Asignamos los clusters
+df_gmm$cluster_final <- as.factor(gmm_active$classification)
+df_vis$cluster_gmm <- as.factor(df_gmm$cluster_final)
+
+table(df_gmm$cluster_final)
+```
+
+```{r}
+plot_ly(df_vis,
+  x = ~UMAP1,
+  y = ~UMAP2,
+  z = ~UMAP3,
+  color = ~cluster_gmm,
+  type = "scatter3d",
+  mode = "markers",
+  text = ~name,
+  hovertemplate = paste(
+    "<b>%{text}</b><br>",
+    "Cluster: %{color}<br>",
+    "<extra></extra>"
+  ),
+  marker = list(size = 3, opacity = 0.7)
+) %>%
+  layout(
+    title = "Clustering GMM (Proyección UMAP)",
+    scene = list(
+      xaxis = list(title = "UMAP1"),
+      yaxis = list(title = "UMAP2"),
+      zaxis = list(title = "UMAP3")
+    )
+  )
+```
+
+```{r fig.width=15, fig.height=8}
+library(ggplot2)
+library(tidyr)
+
+# 1. Preparamos los datos en formato largo para ggplot
+df_long <- df_gmm %>%
+  # Selecciona las columnas numéricas relevantes + el cluster
+  select(
+    cluster_final,
+    days_since_release,
+    median_playtime_forever_log,
+    median_playtime_2weeks_log,
+    all_time_peak_log,
+    popularity_index,
+    num_tag_association_log
+  ) %>%
+  pivot_longer(cols = -cluster_final, names_to = "Variable", values_to = "Valor")
+
+# 2. El Gráfico de la Verdad
+ggplot(df_long, aes(x = as.factor(cluster_final), y = Valor, fill = as.factor(cluster_final))) +
+  # El Boxplot muestra: Mediana (línea), Rango Intercuartílico (Caja) y Bigotes (Dispersión)
+  geom_boxplot(alpha = 0.7, outlier.size = 0.5) +
+  facet_wrap(~Variable, scales = "free_y") +
+  theme_minimal() +
+  labs(
+    title = "Dispersión Real de cada Cluster",
+    subtitle = "¿Se distinguen o es todo lo mismo?",
+    x = "Cluster",
+    y = "Valor (Escala Log)"
+  ) +
+  theme(legend.position = "none")
+```
+
+```{r}
+df_for_csv <- df_gmm |>
+  select(appid, name, cluster_final)
+write_csv(df_for_csv, "../data/clustering.csv")
+```
+
+
+# Validación con Incertidumbre (GMM Nativo)
+La incertidumbre mide la duda del modelo: 0 = Seguro, 1 = Totalmente perdido. Esta métrica es más justa para GMM que la Silueta porque respeta la geometría elipsoidal del modelo.
+
+```{r}
+# Extraemos la incertidumbre del modelo GMM ya calculado
+df_vis$uncertainty <- gmm_active$uncertainty
+
+# 1. Histograma de Incertidumbre
+ggplot(df_vis, aes(x = uncertainty)) +
+  geom_histogram(binwidth = 0.05, fill = "orange", color = "black", alpha = 0.7) +
+  theme_minimal() +
+  labs(
+    title = "Distribución de Incertidumbre del Modelo GMM",
+    subtitle = "Barras a la izquierda (0) = Asignaciones Seguras. Barras a la derecha = Fronteras.",
+    x = "Incertidumbre (0 = Seguro, >0.5 = Zona Difusa)",
+    y = "Cantidad de Juegos"
+  )
+```
+
+```{r}
+# 2. Visualización 3D de la Incertidumbre sobre UMAP
+plot_ly(df_vis,
+  x = ~UMAP1,
+  y = ~UMAP2,
+  marker = list(
+    color = ~uncertainty,
+    colorscale = "Viridis", # Escala: Morado = Seguro, Amarillo = Incierto
+    reversescale = TRUE,
+    showscale = TRUE,
+    size = 3,
+    opacity = 0.8
+  ),
+  type = "scatter",
+  mode = "markers",
+  text = ~name,
+  hovertemplate = paste(
+    "<b>%{text}</b><br>",
+    "Incertidumbre: %{marker.color:.3f}<br>",
+    "<extra></extra>"
+  )
+) %>%
+  layout(
+    title = "Mapa de Calor de Incertidumbre (UMAP)",
+    scene = list(
+      xaxis = list(title = "UMAP1"),
+      yaxis = list(title = "UMAP2"),
+      zaxis = list(title = "UMAP3")
+    )
+  )
+```
+```
+Si el promedio es positivo y alto (>0.4 o 0.5), la estructura es fuerte. Si es bajo (<0.2), los clusters se solapan o no son compactos. Esto es esperable en datos de '�xito' que suelen ser un continuo (una cola larga) m�s que grupos separados.
+

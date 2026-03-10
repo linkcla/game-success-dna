@@ -1,0 +1,62 @@
+---
+title: "decission_trees"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(rpart)
+library(rpart.plot)
+library(caret)
+```
+
+
+```{r}
+df_clusters <- read_csv("../data/clustering.csv")
+source("../scripts/cleaning_pipeline.R", chdir = TRUE)
+
+df_clean <- df_final |> 
+  select(appid, genres, windows, mac, linux, required_age, has_violence, 
+         has_gore, has_nudity_sexual, has_horror, has_gambling)
+df <- merge(df_clusters, df_clean, by = "appid", all.x = TRUE)
+```
+
+```{r}
+all_genres <- unique(unlist(df$genres))
+
+tree_data_ready <- df %>%
+  select(-all_of(c("appid", "name"))) 
+
+# Tranform genres and apply one-hot encoding
+for (g in all_genres) {
+  col_name <- paste0("genre_", make.names(g)) 
+  tree_data_ready[[col_name]] <- map_int(df$genres, ~ as.integer(g %in% .x))
+}
+
+tree_data_ready <- tree_data_ready %>% select(-genres) 
+
+# Tranform columns to factors so we have FALSE/TRUE values instead of numbers
+tree_data_factors <- tree_data_ready %>%
+  mutate(
+    across(starts_with("genre_"), as.factor),
+    across(any_of(c("windows", "mac", "linux", "has_violence", "required_age", "has_gore", "has_nudity_sexual", "has_horror", "has_gambling")), as.factor)
+  )
+```
+
+```{r, fig.width=15, fig.height=20}
+# Train the tree
+tree_model <- rpart(cluster_final ~ ., 
+                      data = tree_data_factors, 
+                      method = "class",
+                      cp = 0.004,
+                    parms = list(split = "information"))
+
+rpart.plot(tree_model, 
+           type = 1, 
+           box.palette = "RdGn", 
+           extra = 108,       # <--- CAMBIO CLAVE: Muestra prob. del ganador
+           tweak = 1.5,       # Bajé un poco el tweak para que quepa el texto
+           leaf.round = 0,
+           under = TRUE)      # Pone el dato DEBAJO de la caja para que se lea mejor
+```

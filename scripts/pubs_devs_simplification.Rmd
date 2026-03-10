@@ -1,0 +1,224 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readr)
+library(tidyverse)
+library(lubridate)
+library(stringr)
+```
+
+```{r}
+source("cleaning_pipeline.R")
+```
+
+Vamos a contar el numero de publishers y developers por juego para poder calcular el maximo de developers y publishers que puede llegar a tener un juego
+
+```{r}
+def_pub_dev <- df_clean %>% select(appid, publishers, developers)
+def_pub_dev[def_pub_dev$appid == 298280,]$publishers = def_pub_dev[def_pub_dev$appid == 298280, ]$developers
+```
+
+```{r}
+pubs_list <- unlist(def_pub_dev$publishers) %>% unique()
+devs_list <- unlist(def_pub_dev$developers) %>% unique()
+
+df_pubs_and_devs <- data.frame(companies = unlist(c(pubs_list, devs_list)) %>% unique())
+```
+
+```{r}
+df_pubs_and_devs <- df_pubs_and_devs %>% mutate(
+  companies = gsub("[.,()\'\"]", " ", companies),
+  companies = gsub("\\s+", " ", companies),
+  companies = gsub("(\\d)\\s+([^\\s])", "\\1\\2", companies),
+  companies = gsub("The ", " ", companies),
+  companies = gsub("Black ", " ", companies),
+  companies = gsub("Team ", " ", companies),
+  companies = gsub("Studio ", " ", companies),
+  companies = gsub("Pixel ", " ", companies),
+  companies = trimws(companies)
+)
+```
+
+```{r}
+splited_companies <- split(df_pubs_and_devs$companies, word(df_pubs_and_devs$companies))
+```
+
+```{r}
+# Función para encontrar el prefijo común más largo en un vector de nombres
+# Para poder unificar nombres de desarrolladores o publishers similares
+common_root <- function(names_vec) {
+  # 1. Normalizar
+  clean <- tolower(names_vec)
+  clean <- gsub("\\(.*?\\)", "", clean)          # quitar paréntesis
+  clean <- gsub("[^a-z0-9 ]", " ", clean)        # quitar símbolos raros
+  clean <- gsub("\\s+", " ", clean)              # espacios múltiples
+  clean <- trimws(clean)
+
+  # 2. Separar palabras
+  words_list <- strsplit(clean, " ")
+
+  # 3. Calcular el mínimo número de palabras
+  min_len <- min(sapply(words_list, length))
+
+  # 4. Buscar prefijo común palabra a palabra
+  prefix <- c()
+  for (i in seq_len(min_len)) {
+    w <- sapply(words_list, function(x) x[i])
+    if (length(unique(w)) == 1) {
+      prefix <- c(prefix, w[1])
+    } else break
+  }
+
+  # 5. Volver a capitalizar bonito
+  root <- paste(prefix, collapse = " ")
+  root <- tools::toTitleCase(root)
+  return(root)
+}
+```
+
+```{r}
+generic_words <- c(
+  "digital", "studio", "studios", "interactive",
+  "entertainment", "software", "media",
+  "big", "small", "tiny", "pixel", "pixels",
+  "red", "blue", "green", "black", "white",
+  "team", "dev", "developers", "productions", "the"
+)
+
+
+normalize_name <- function(x) {
+  x <- tolower(x)
+  x <- gsub("\\(.*?\\)", "", x)
+  x <- gsub("[^a-z0-9 ]", " ", x)
+  x <- gsub("\\s+", " ", x)
+  trimws(x)
+}
+
+
+common_root_valid <- function(names_vec, generic_words, min_words = 1) {
+  clean <- normalize_name(names_vec)
+  words_list <- strsplit(clean, " ")
+
+  min_len <- min(sapply(words_list, length))
+  prefix <- character(0)
+
+  for (i in seq_len(min_len)) {
+    w <- sapply(words_list, `[`, i)
+    if (length(unique(w)) == 1) {
+      prefix <- c(prefix, w[1])
+    } else break
+  }
+
+  if (length(prefix) < min_words) return(NULL)
+  if (prefix[1] %in% generic_words) return(NULL)
+
+  tools::toTitleCase(paste(prefix, collapse = " "))
+}
+
+
+add_to_groups <- function(name, groups, generic_words) {
+
+  # Si no hay grupos aún
+  if (length(groups) == 0) {
+    groups[[name]] <- c(name)
+    return(groups)
+  }
+
+  for (root in names(groups)) {
+    candidate <- c(groups[[root]], name)
+
+    new_root <- common_root_valid(candidate, generic_words)
+
+    if (!is.null(new_root)) {
+      # Reasignamos el grupo con la nueva raíz
+      groups[[root]] <- NULL
+      groups[[new_root]] <- candidate
+      return(groups)
+    }
+  }
+
+  # Si no encaja en ningún grupo
+  groups[[name]] <- c(name)
+  groups
+}
+
+```
+
+```{r}
+groups <- list()
+
+length(df_pubs_and_devs$companies)
+i <- 0
+for (n in df_pubs_and_devs$companies) {
+  groups <- add_to_groups(n, groups, generic_words)
+  i <- i+1
+  cat(i, sep = "\n")
+}
+```
+
+```{r}
+invert_company_map <- function(company_map) {
+  inverted <- list()
+
+  for (root in names(company_map)) {
+    variants <- company_map[[root]]
+
+    for (v in variants) {
+      inverted[[v]] <- root
+    }
+  }
+
+  inverted
+}
+
+# Invert de map values to complete the names simplification
+company_lookup <- invert_company_map(groups)
+
+prepare_name <- function(name) {
+  normalized_name <- gsub("[\\(\\.,\\)]", "", name)
+  normalized_name <- gsub("\\s+", " ", normalized_name)
+  normalized_name <- trimws(normalized_name)
+  normalized_name
+}
+
+normalize_company <- function(name, lookup) {
+  if (is.na(name)) return(NA_character_)
+  normalized_name = prepare_name(name)
+  if (normalized_name %in% names(lookup)) {
+    lookup[[normalized_name]]
+  } else {
+    normalized_name
+  }
+}
+```
+
+```{r}
+df_pubs_devs_clean$publishers <- lapply(
+  df_pubs_devs_clean$publishers,
+  function(pubs) {
+    unique(
+      unlist(
+        lapply(pubs, normalize_company, lookup = company_lookup),
+        use.names = FALSE
+      )
+    )
+  }
+)
+
+```
+
+```{r}
+df_pubs_devs_clean$developers <- lapply(
+  df_pubs_devs_clean$developers,
+  function(pubs) {
+    unique(
+      unlist(
+        lapply(pubs, normalize_company, lookup = company_lookup),
+        use.names = FALSE
+      )
+    )
+  }
+)
+```

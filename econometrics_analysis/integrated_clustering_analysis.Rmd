@@ -1,0 +1,427 @@
+```{r packages, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 6)
+library(tidyverse)
+library(scales)
+library(ggthemes)
+library(viridis)
+library(rpart)
+library(rpart.plot)
+library(gridExtra)
+
+# Helper function for Mode
+get_mode <- function(x) {
+    ux <- unique(na.omit(x))
+    ux[which.max(tabulate(match(x, ux)))]
+}
+```
+
+# 1. Configuration and Data Merging
+
+We consolidate data from three sources to build a comprehensive view of each cluster:
+1.  **Cluster Assignments**: Determination of the segment each game belongs to.
+2.  **Game Metadata**: Price, release date, version count, monetization features.
+3.  **Peak Data**: Real-time concurrent player peaks from SteamDB.
+
+```{r data}
+# Load Cluster Results
+clustering_path <- "../data/clustering.csv"
+df_clusters <- read_csv(clustering_path, col_types = cols())
+
+source("../scripts/cleaning_pipeline.R", chdir = TRUE)
+scrapdb <- read_csv("../scraping/steamdb_top_peaks_cleaned.csv") %>%
+    rename("all_time_peak" = "All-Time Peak", "24h_peak" = "24h Peak") %>%
+    select(appid, all_time_peak, `24h_peak`)
+
+
+df_integrated <- df_clusters %>%
+    inner_join(df_final, by = "appid") %>%
+    left_join(scrapdb, by = "appid") %>%
+    distinct(appid, .keep_all = TRUE)
+```
+
+## Feature Engineering
+
+We calculate all critical ratios and monetization indicators here.
+
+```{r data2}
+df_analysis <- df_integrated %>%
+    mutate(
+        cluster_final = as.factor(cluster_final),
+
+        # --- Monetization Flags ---
+        is_free = price == 0,
+        type_game = ifelse(is_free, "Free", "Paid"),
+        has_versions = count_versions > 0,
+        has_subscriptions = count_subscriptions > 0,
+        has_micropayments = count_micropayments > 0,
+        fidelitat = all_time_peak / owners_avg,
+        conversion_reviews = total_reviews / owners_avg,
+        engagement_per_euro = median_playtime_forever / (price + 1),
+        retention_potential = `24h_peak` / all_time_peak,
+        tagging_intensity = num_tag_association / owners_avg
+    )
+```
+
+---
+
+# 2. Economic Profile
+
+We analyze how clusters differ in terms of pricing strategy and monetization. Our initial hypotheses are:
+
+*   **Premium (Cluster 1):** High prices justified by "production values".
+*   **Niche (Cluster 6):** Loyal audience willing to pay.
+*   **Low-Cost/Forgotten (Cluster 4):** Residual prices.
+*   **Newcomers (Cluster 7):** Unknown between "Indie Premium" or penetration strategy.
+
+## Price Distribution (Paid Games Only)
+
+```{r price, fig.width=13}
+df_paid <- df_analysis
+
+ggplot(df_paid, aes(x = cluster_final, y = price, fill = cluster_final)) +
+    geom_violin(alpha = 0.5, trim = FALSE) +
+    geom_boxplot(width = 0.2, color = "black", alpha = 0.8, outlier.shape = NA) +
+    scale_fill_tableau() +
+    scale_y_continuous(labels = dollar_format(suffix = "€", prefix = ""), limits = c(0, 100)) +
+    labs(
+        title = "Price Distribution by Cluster (Paid Only)",
+        subtitle = "Excluding extreme outliers > 100€",
+        x = "Cluster", y = "Price (€)"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "none")
+```
+
+## Free vs Paid Distribution
+
+```{r free}
+df_analysis %>%
+    group_by(cluster_final, type_game) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    group_by(cluster_final) %>%
+    mutate(pct = n / sum(n)) %>%
+    ggplot(aes(x = cluster_final, y = pct, fill = type_game)) +
+    geom_col(position = "fill", width = 0.7, color = "black", alpha = 0.8) +
+    geom_text(aes(label = percent(pct, accuracy = 0.1)),
+        position = position_fill(vjust = 0.5),
+        color = "white", fontface = "bold", size = 3.5
+    ) +
+    scale_y_continuous(labels = percent_format()) +
+    scale_fill_manual(values = c("Free" = "#2ecc71", "Paid" = "#34495e")) +
+    coord_flip() +
+    labs(
+        title = "Free vs Paid Proportion",
+        x = "Cluster",
+        y = "Percentage",
+        fill = "Type"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "top")
+```
+
+### Business Model Insights:
+1.  **Betting on Paid:** Young clusters (**7 and 3**) have the highest rates of paid games (>96%), indicating a clear intention to monetize via direct sales.
+2.  **The Casual Space (Cluster 5):** It is the only one with a massive presence of *Free-to-Play* (27%), aligned with short experiences or prologues.
+3.  **Premium Services (Cluster 1):** Despite being mostly paid, it includes F2P giants (Dota 2, CS2) that positively distort total revenue.
+
+## Price Density (Psychological Price Points)
+
+```{r price_density}
+df_paid <- df_analysis
+
+ggplot(df_paid, aes(x = price, fill = cluster_final)) +
+    geom_density(alpha = 0.6, color = "black") +
+    scale_x_continuous(trans = "log1p", breaks = c(0, 5, 10, 20, 60), labels = dollar_format(suffix = "€", prefix = "")) +
+    scale_fill_tableau() +
+    labs(
+        title = "Price Density Estimate (Log Scale)",
+        subtitle = "Where do price tags concentrate?",
+        x = "Price (Log Scale)",
+        y = "Density",
+        fill = "Cluster"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "top")
+```
+
+### Pricing Strategy Insights:
+*   **Cluster 4 (Forgotten) vs Cluster 1 (Top Hits):** Total contrast. The forgotten fall into the "death zone" (1-5€), while hits feel comfortable above 20-30€.
+*   **Cluster 7 (Hidden Gems):** Roughly positioned around **20€**. They avoid competing on price (low-cost) and seek an "Indie Premium" profile.
+*   **Cluster 3 (Flops):** Stuck in no man's land (~10€), too expensive to be an impulse buy but perhaps lacking the perceived quality of the 20€ range.
+
+## Monetization Depth
+
+```{r monetization, fig.height=8}
+plot_prop <- function(var, title) {
+    df_analysis %>%
+        group_by(cluster_final) %>%
+        summarise(pct = mean(!!sym(var), na.rm = TRUE)) %>%
+        ggplot(aes(x = cluster_final, y = pct, fill = cluster_final)) +
+        geom_col(color = "black", alpha = 0.8) +
+        geom_text(aes(label = percent(pct, accuracy = 0.1)), vjust = -0.5, fontface = "bold") +
+        scale_y_continuous(labels = percent_format(), limits = c(0, 1.1)) +
+        scale_fill_tableau() +
+        labs(title = title, x = "Cluster", y = "% Games") +
+        theme_minimal() +
+        theme(legend.position = "none")
+}
+
+p1 <- plot_prop("has_versions", "% with Multiple Editions")
+p2 <- plot_prop("has_micropayments", "% with Micropayments")
+p3 <- plot_prop("has_subscriptions", "% with Subscriptions")
+
+grid.arrange(p1, p2, p3, ncol = 2)
+```
+
+*   **Micropayments:** **Cluster 1** (2.4%) triples the average. Recurring monetization is a game of volume and community.
+*   **Subscriptions:** Shared dominance between **Cluster 1** and **Cluster 6** (Hardcore), typical of MMOs or complex simulators.
+
+## Price vs Quality
+
+```{r price_quality, fig.height=8}
+df_quality <- df_analysis %>%
+    mutate(quality_index = total_positive / total_reviews) %>%
+    filter(price > 0, price < 80) # Filter free and extreme outliers
+
+ggplot(df_quality, aes(x = price, y = quality_index, color = cluster_final)) +
+    geom_point(alpha = 0.3, size = 1) +
+    geom_smooth(method = "lm", color = "black", size = 0.5) +
+    facet_wrap(~cluster_final) +
+    scale_x_log10(labels = dollar_format(suffix = "€", prefix = ""), breaks = c(1, 2, 5, 10, 20, 60)) +
+    scale_y_continuous(labels = percent_format(accuracy = 1)) +
+    scale_color_tableau() +
+    labs(
+        title = "Price vs Perceived Quality Relationship",
+        subtitle = "Does paying more guarantee better reviews?",
+        x = "Price (Log Scale)", y = "User Rating (% Positive)"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "none")
+```
+
+### Perceived Value Insights:
+*   **Fair Price Law:** Only in "cheap" games (Cluster 4) does paying a bit more improve quality.
+*   **Premium Stability:** In hits (1 and 7), price does not predict the rating. Once a quality standard is reached, price is irrelevant to satisfaction.
+
+---
+
+# 3. Performance Ratios (The "Value" Equation)
+
+We define synthetic indicators to measure the quality of success:
+
+1.  **Fidelity (Hype):** `Historical Peak / Owners`. Measures simultaneous mobilization.
+2.  **Efficiency (Value):** `Minutes / Price`. Return on investment for the player.
+3.  **Retention (Longevity):** `24h Peak / Historical Peak`. Current health and game survival.
+
+## Community Fidelity and Density
+
+```{r fidelity}
+ggplot(df_analysis, aes(x = cluster_final, y = fidelitat, fill = cluster_final)) +
+    geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+    scale_y_log10() +
+    scale_fill_viridis_d(option = "magma") +
+    labs(
+        title = "Community Fidelity (Peak / Owners)",
+        subtitle = "Log Scale. Higher = More simultaneous engagement.",
+        y = "Fidelity Ratio (Log)", x = "Cluster"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "none")
+```
+
+### Fidelity Insights:
+*   **Flop Paradox (Cluster 3):** They have the highest ratio because they are "Front-loaded" sales. Everyone who bought it played on day 1 and then disappeared. There is no "long tail".
+*   **Health of Hits (Cluster 1):** Moderate-high ratio. They have giant peaks, but even more buyers over time. Perfect balance.
+*   **Cult (Cluster 6):** Low ratio. They have accumulated users for years without needing a massive viral peak.
+
+## Engagement Efficiency (Value for Money)
+
+```{r efficiency}
+ggplot(df_analysis, aes(x = cluster_final, y = engagement_per_euro, fill = cluster_final)) +
+    geom_violin(alpha = 0.6) +
+    scale_y_log10() +
+    scale_fill_viridis_d(option = "viridis") +
+    labs(
+        title = "Engagement Efficiency (Minutes / €)",
+        subtitle = "Log Scale. The 'Evergreens' shine here.",
+        y = "Minutes per Euro", x = "Cluster"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "none")
+```
+
+## Retention Potential (Longevity)
+
+```{r retention}
+ggplot(df_analysis, aes(x = cluster_final, y = retention_potential, fill = cluster_final)) +
+    geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+    scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+    scale_fill_viridis_d(option = "cividis") +
+    labs(
+        title = "Retention Potential (24h Peak / Historical Peak)",
+        subtitle = "Higher = The game is still very alive today.",
+        y = "Retention %", x = "Cluster"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "none")
+```
+
+### Longevity Insights:
+*   **Leaders (1 and 6):** "Service" and "hardcore" games are the only ones keeping communities alive for years.
+*   **Promise (7):** "Hidden Gems" show excellent retention, indicating they are building community and are not a one-day wonder.
+*   **Abandonment (4, 3, and 5):** Forgotten, flops, and casuals have minimal retention, either due to disinterest or design (short games).
+
+---
+
+# 4. Synthesis and Final Profiling
+
+To close the analysis, we use a Decision Tree to extract the mathematical "rules" separating the clusters and cross-reference this information with graphical evidence to define the final profiles.
+
+## Classification Rules (Decision Tree)
+
+Which ratios best separate a hit from a flop?
+
+```{r decision_tree, fig.width=12, fig.height=8}
+# Prepare data for modeling
+model_data <- df_analysis %>%
+    select(
+        cluster_final,
+        price,
+        fidelitat,
+        conversion_reviews,
+        engagement_per_euro,
+        retention_potential,
+        tagging_intensity,
+        has_micropayments
+    ) %>%
+    na.omit()
+
+# Train Tree
+tree_model <- rpart(
+    cluster_final ~ .,
+    data = model_data,
+    method = "class",
+    control = rpart.control(cp = 0.0025, maxdepth = 6)
+)
+
+# Plot
+rpart.plot(
+    tree_model,
+    type = 5,
+    extra = 0,
+    box.palette = "BuGn",
+    branch.lty = 3,
+    shadow.col = "gray90",
+    nn = TRUE,
+    main = "Decision Tree: Rules of Success"
+)
+```
+
+## Feature Importance
+
+```{r importance}
+importance <- data.frame(
+    Variable = names(tree_model$variable.importance),
+    Importance = tree_model$variable.importance
+) %>%
+    arrange(desc(Importance))
+
+ggplot(importance, aes(x = reorder(Variable, Importance), y = Importance)) +
+    geom_col(fill = "#34495e") +
+    coord_flip() +
+    theme_minimal() +
+    labs(
+        title = "Feature Importance (Tree)",
+        subtitle = "What defines a game's personality the most?",
+        x = "", y = "Importance Score"
+    )
+```
+
+## Final Graphical Evidence
+
+Before the definition, we visualize the order-of-magnitude differences in key metrics.
+
+```{r cluster_evidence, fig.width=14, fig.height=8}
+df_evidence <- df_analysis %>%
+    select(cluster_final, days_since_release, median_playtime_forever, total_reviews, all_time_peak) %>%
+    pivot_longer(
+        cols = c(days_since_release, median_playtime_forever, total_reviews, all_time_peak),
+        names_to = "Metric", values_to = "Value"
+    ) %>%
+    mutate(
+        Metric = recode(Metric,
+            "days_since_release" = "Age (Days)",
+            "median_playtime_forever" = "Retention (Minutes Played)",
+            "total_reviews" = "Popularity (Total Reviews)",
+            "all_time_peak" = "Max Peak (Virality)"
+        )
+    )
+
+ggplot(df_evidence, aes(x = cluster_final, y = Value, fill = cluster_final)) +
+    geom_boxplot(alpha = 0.7, outlier.shape = 1, outlier.alpha = 0.3) +
+    facet_wrap(~Metric, scales = "free_y") +
+    scale_y_log10(labels = scales::label_number(accuracy = 1)) +
+    scale_fill_tableau() +
+    labs(
+        title = "Key Variables Distribution (Evidence)",
+        subtitle = "Logarithmic Scale to appreciate orders of magnitude.",
+        x = "Cluster",
+        y = "Value (Log Scale)"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "none", strip.text = element_text(face = "bold", size = 12))
+```
+
+## Definitive Cluster Definitions
+
+Based on all economic and performance analysis, this is the map of the Steam market:
+
+1.  **Cluster 1: Top Hits / Superstars**
+    *   **Profile:** Consolidated commercial hits, "Games as a Service," and AAA.
+    *   **Keys:** Massive popularity, Premium prices (>30€), high retention, and absolute dominance of micropayments.
+
+2.  **Cluster 6: Cult Classics / Hardcore**
+    *   **Profile:** Deep niche games (Simulators, Strategy) with very loyal communities.
+    *   **Keys:** The highest retention of all, brutal minutes/euro efficiency, but moderate popularity. They don't live on hype, but on depth.
+
+3.  **Cluster 7: Hidden Gems / Promising Newcomers**
+    *   **Profile:** Recent releases with real traction.
+    *   **Keys:** "Indie Premium" price (~20€), high retention comparable to Top Hits. They are the future growing stars.
+
+4.  **Cluster 2: Established / "Long Tail"**
+    *   **Profile:** The Steam middle class. Veteran games that work without being stars.
+    *   **Keys:** The largest group, stable metrics.
+
+5.  **Cluster 5: Short Experiences / Casual**
+    *   **Profile:** Short narrative games or experiments.
+    *   **Keys:** Very Free-to-Play, low prices, low retention (by design).
+
+6.  **Cluster 3: Flops ("Front-loaded")**
+    *   **Profile:** Failed releases.
+    *   **Keys:** Deceptively high fidelity (everyone played on day 1 and left). Strange "no man's land" prices (~10€).
+
+7.  **Cluster 4: Forgotten / Deprecated**
+    *   **Profile:** The Steam graveyard.
+    *   **Keys:** Prices <5€, zero popularity and retention.
+
+---
+
+### DNA Summary (Final Table)
+
+```{r dna_summary}
+dna_summary <- df_analysis %>%
+    group_by(cluster_final) %>%
+    summarise(
+        Count = n(),
+        Avg_Price = mean(price, na.rm = TRUE),
+        Pct_Free = mean(is_free, na.rm = TRUE),
+        Avg_Fidelity = mean(fidelitat, na.rm = TRUE),
+        Avg_Retention = mean(retention_potential, na.rm = TRUE),
+        Avg_Efficiency = mean(engagement_per_euro, na.rm = TRUE),
+        Pct_Micro = mean(has_micropayments, na.rm = TRUE)
+    ) %>%
+    arrange(desc(Count)) %>%
+    mutate(across(where(is.numeric), ~ round(., 3)))
+
+knitr::kable(dna_summary, caption = "Cluster DNA: Economic and Performance Footprint")
+```

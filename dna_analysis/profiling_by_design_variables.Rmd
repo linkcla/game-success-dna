@@ -1,0 +1,396 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(tm)
+library(scales)
+library(jsonlite)
+```
+
+## 1. Load Data
+
+```{r load_data}
+# Load rich dataset using the pipeline
+source("../scripts/cleaning_pipeline.R", chdir = TRUE)
+
+df_clusters <- read_csv("../data/clustering.csv", show_col_types = FALSE)
+
+# Merge clusters with features
+df_merged <- df_clusters %>%
+    select(appid, cluster_final) %>%
+    inner_join(df_final, by = "appid")
+
+# --- FIX: Restore Categories and Tags ---
+# The pipeline removes these text columns, but we need them for DNA decomposition.
+# We load the raw data to retrieve them.
+df_raw_restore <- read_csv("../data/games_march2025_cleaned.csv", show_col_types = FALSE) %>%
+    select(appid, categories, tags)
+
+df_merged <- df_merged %>%
+    left_join(df_raw_restore, by = "appid")
+
+# Count games per cluster
+cluster_counts <- df_merged %>%
+    count(cluster_final, name = "total_games")
+```
+
+**Explanation:**  
+This chunk handles the data ingestion. We use a custom cleaning pipeline to load the raw Steam data and then merge it with the clustering results (`clustering.csv`). Crucially, we restore the original `categories` and `tags` columns from the raw dataset (`games_march2025_cleaned.csv`) because they are essential for the DNA decomposition but might have been simplified in the clustering input. Finally, we calculate `cluster_counts` to know the size of each cluster.
+
+**Result:**  
+A `df_merged` dataframe containing both the cluster labels and the rich textual features (Tags, Categories) for every game.
+
+## 2. Numeric DNA Profile (Averages)
+
+```{r numeric_profile}
+profile_numeric <- df_merged %>%
+    group_by(cluster_final) %>%
+    summarise(
+        # Identity
+        avg_genres = mean(num_genres, na.rm = TRUE),
+        avg_tags = mean(num_tags.x, na.rm = TRUE),
+
+        # Content Flags
+        pct_violence = mean(has_violence, na.rm = TRUE),
+        pct_gore = mean(has_gore, na.rm = TRUE),
+        pct_nudity = mean(has_nudity_sexual, na.rm = TRUE),
+        pct_horror = mean(has_horror, na.rm = TRUE),
+        pct_sexual_content = mean(has_adult_general, na.rm = TRUE),
+
+        # Tech
+        avg_languages = mean(num_languages, na.rm = TRUE),
+        pct_multiplatform = mean(as.numeric(mac) + as.numeric(linux) > 0, na.rm = TRUE),
+        pct_windows = mean(as.numeric(windows), na.rm = TRUE),
+        pct_mac = mean(as.numeric(mac), na.rm = TRUE),
+        pct_linux = mean(as.numeric(linux), na.rm = TRUE),
+
+        # Economics
+        avg_price = mean(price, na.rm = TRUE),
+        avg_discount = mean(discount, na.rm = TRUE),
+        avg_dlc = mean(dlc_count, na.rm = TRUE),
+
+        # Engagement
+        avg_playtime = mean(average_playtime_forever, na.rm = TRUE),
+        avg_review_score = mean(review_score, na.rm = TRUE),
+        avg_screenshots = mean(screenshots_count, na.rm = TRUE),
+        avg_achievements = mean(achievements, na.rm = TRUE),
+
+        # Strategy
+        avg_versions = mean(count_versions, na.rm = TRUE),
+        avg_subscriptions = mean(count_subscriptions, na.rm = TRUE),
+        pct_micropayments = mean(count_micropayments > 0, na.rm = TRUE),
+
+        # Key Categories (Derived)
+        pct_single_player = mean(str_detect(categories, "Single-player"), na.rm = TRUE),
+
+        # Complexity
+        avg_tag_complexity = mean(num_tag_association, na.rm = TRUE)
+    )
+
+print(profile_numeric, width = Inf)
+```
+
+**Explanation:**  
+This is the core aggregation step. We group everything by `cluster_final` and calculate the "average game" for each cluster across multiple dimensions:
+*   **Identity**: How many genres/tags they usually have.
+*   **Content**: Percentages of Violence, Gore, Nudity (extracted from content descriptors).
+*   **Tech**: Language support, Platform support (Windows/Mac/Linux).
+*   **Economics**: Price points, Discounts, DLC counts.
+*   **Strategy**: Micropayments, Versioning, Subscriptions.
+
+**Result:**  
+A `profile_numeric` table where each row is a cluster and columns are the average values (e.g., "Cluster 1 has 55% violence", "Cluster 2 has avg price $15").
+
+## 3. DNA Composition (Decomposition)
+
+We analyze the *composition* of each cluster: What Genres, Categories, and Tags make them unique?
+
+### 3.1 Genre DNA
+
+```{r genre_dna, fig.height=8, fig.width=12}
+# Unnest Genres (assuming it's a list column from the pipeline)
+# If it's a string, we fix it first
+if (is.character(df_merged$genres)) {
+    # Fallback if it's not a list column in this environment
+    # Remove c() or [''] characters and split
+    df_merged$genres_list <- str_split(str_remove_all(df_merged$genres, "\\[|\\]|'"), ", ")
+} else {
+    df_merged$genres_list <- df_merged$genres
+}
+
+genre_dna <- df_merged %>%
+    select(appid, cluster_final, genres_list) %>%
+    unnest(genres_list) %>%
+    mutate(genre = trimws(genres_list)) %>%
+    filter(genre != "") %>%
+    count(cluster_final, genre) %>%
+    left_join(cluster_counts, by = "cluster_final") %>%
+    mutate(prevalence = n / total_games)
+
+# Visualization: Heatmap of Top Genres
+top_genres <- genre_dna %>%
+    group_by(genre) %>%
+    summarise(total_prev = sum(prevalence)) %>%
+    top_n(20, total_prev) %>%
+    pull(genre)
+
+genre_dna %>%
+    filter(genre %in% top_genres) %>%
+    ggplot(aes(x = factor(cluster_final), y = genre, fill = prevalence)) +
+    geom_tile() +
+    scale_fill_viridis_c(labels = percent) +
+    labs(title = "Genre DNA Heatmap", x = "Cluster", y = "Genre", fill = "% Games") +
+    theme_minimal()
+```
+
+**Explanation (Genres):**  
+We unnest the `genres` column to count how frequently each Genre appears in each cluster. We then visualize this as a heatmap.
+**Result:** A heatmap showing which Genres (Action, RPG, Strategy) dominate each cluster.
+
+### 3.2 Category DNA
+
+```{r category_dna, fig.height=8, fig.width=12}
+# Categories come separated by ";" in some versions or list in others.
+# Cleaning pipeline: categories = str_extract_all(...) -> List
+# OR df_final$categories might be raw string "Single-player;Multi-player" depending on version.
+# Let's inspect ONE element to be safe or just use regex split which works for both.
+
+# Safely extract categories
+get_cats <- function(x) {
+    if (is.list(x)) {
+        return(x)
+    }
+    return(str_split(x, ";"))
+}
+
+category_dna <- df_merged %>%
+    mutate(cats_list = get_cats(categories)) %>%
+    select(appid, cluster_final, cats_list) %>%
+    unnest(cats_list) %>%
+    mutate(category = trimws(cats_list)) %>%
+    filter(category != "") %>%
+    count(cluster_final, category) %>%
+    left_join(cluster_counts, by = "cluster_final") %>%
+    mutate(prevalence = n / total_games)
+
+# Heatmap
+top_cats <- category_dna %>%
+    group_by(category) %>%
+    summarise(total_prev = sum(prevalence)) %>%
+    top_n(20, total_prev) %>%
+    pull(category)
+
+category_dna %>%
+    filter(category %in% top_cats) %>%
+    ggplot(aes(x = factor(cluster_final), y = category, fill = prevalence)) +
+    geom_tile() +
+    scale_fill_viridis_c(option = "magma", labels = percent) +
+    labs(title = "Category DNA Heatmap", x = "Cluster", y = "Category", fill = "% Games") +
+    theme_minimal()
+```
+
+**Explanation (Categories):**  
+Similar to genres, we break down the `categories` (Single-player, Co-op, etc.).
+**Result:** A heatmap revealing the functional "shape" of the games (e.g., distinctly Multiplayer vs. Solo clusters).
+
+### 3.3 Tag DNA (High Resolution)
+
+```{r tag_dna, fig.height=10, fig.width=12}
+# Tags are in a python dictionary string "{'FPS': 90857, ...}"
+# We need to parse names.
+# Simple regex strategy: extract words between single quotes that are keys.
+
+extract_tags <- function(tag_str) {
+    # Extract all 'Key' patterns
+    # The string format is {'Tag': Votes, ...}
+    # We just want the Tag names for now
+    str_extract_all(tag_str, "(?<=')[^']+(?=':)")
+}
+
+tag_dna <- df_merged %>%
+    mutate(tags_list = extract_tags(tags)) %>%
+    select(appid, cluster_final, tags_list) %>%
+    unnest(tags_list) %>%
+    mutate(tag = trimws(tags_list)) %>%
+    count(cluster_final, tag) %>%
+    left_join(cluster_counts, by = "cluster_final") %>%
+    mutate(prevalence = n / total_games)
+
+# Filter for distinctive tags per cluster (High Lift)
+# Global frequency roughly
+total_games_all <- nrow(df_merged)
+global_tag_freq <- df_merged %>%
+    mutate(tags_list = extract_tags(tags)) %>%
+    unnest(tags_list) %>%
+    mutate(tag = trimws(tags_list)) %>%
+    count(tag, name = "global_n") %>%
+    mutate(global_prev = global_n / total_games_all)
+
+tag_dna_lift <- tag_dna %>%
+    left_join(global_tag_freq, by = c("tag" = "tag")) %>%
+    mutate(lift = prevalence / global_prev) %>%
+    filter(n > 10) # Minimum support
+
+# Get top 5 tags by Lift for each cluster to see what makes them SPECIAL
+top_distinctive_tags <- tag_dna_lift %>%
+    group_by(cluster_final) %>%
+    top_n(5, lift) %>%
+    ungroup() %>%
+    arrange(cluster_final, desc(lift))
+
+print("--- DISTINCTIVE TAGS PER CLUSTER (High Lift) ---")
+print(top_distinctive_tags %>% select(cluster_final, tag, lift, prevalence), n = 50)
+```
+
+**Explanation (Tags):**  
+Steam Tags are very granular. We parse the JSON-like tag string, count them, and then calculate "Lift" (how much more frequent a tag is in this cluster compared to the global average).
+**Result:** A list of "Distinctive Tags" that define the unique flavor of the cluster (e.g., "Soccer" might have very high lift in a Sports cluster, even if "Action" is more frequent globally).
+
+## 4. Semantic Profiles
+
+```{r semantic_profile}
+# Custom Stopwords for Games
+custom_stopwords <- c("game", "world", "new", "play", "amp", "one", "can", "will", "use", "also", "features", "two", "set")
+
+get_top_terms <- function(cluster_id, df) {
+    terms_list <- df %>%
+        filter(cluster_final == cluster_id) %>%
+        pull(top_terms_abouttxt) %>%
+        na.omit() %>%
+        paste(collapse = ",") %>%
+        strsplit(",") %>%
+        unlist() %>%
+        trimws() %>%
+        tolower() %>%
+        # Filter stopwords
+        .[!. %in% custom_stopwords] %>%
+        table() %>%
+        sort(decreasing = TRUE) %>%
+        head(7) %>% # Top 7 as requested
+        names() %>%
+        paste(collapse = ", ")
+
+    return(terms_list)
+}
+
+cluster_ids <- sort(unique(df_merged$cluster_final))
+semantic_table <- data.frame(
+    cluster_final = cluster_ids,
+    top_terms = sapply(cluster_ids, get_top_terms, df = df_merged)
+)
+
+print(semantic_table)
+```
+
+**Explanation:**  
+We analyze the text description of the games. We use a custom stopword list (removing generic words like "game", "play") to find the top 7 unique keywords for each cluster.
+**Result:** A `semantic_table` containing the "Concept Words" for each cluster (e.g., "Zombie, Survival, Crafting" vs "Puzzle, Logic, Physics").
+
+## 5. Unified DNA Cards (The Developer Recipe)
+
+```{r unified_dna_cards, results='asis'}
+# 1. Global Baselines for Lift Calculation
+global_means <- df_merged %>%
+    summarise(
+        g_lang = mean(num_languages, na.rm = TRUE),
+        g_screens = mean(screenshots_count, na.rm = TRUE),
+        g_achievements = mean(achievements, na.rm = TRUE),
+        g_dlc = mean(dlc_count, na.rm = TRUE)
+    )
+
+# 2. Cluster Profiles with Lift
+dna_cards <- profile_numeric %>%
+    select(
+        cluster_final, avg_languages, avg_screenshots, avg_achievements, avg_dlc,
+        pct_violence, pct_horror, pct_nudity,
+        pct_windows, pct_mac, pct_linux,
+        avg_versions, avg_subscriptions, pct_micropayments, ,
+        pct_single_player, avg_tag_complexity
+    ) %>%
+    mutate(
+        lift_lang = avg_languages / global_means$g_lang,
+        lift_screens = avg_screenshots / global_means$g_screens,
+        lift_achievements = avg_achievements / global_means$g_achievements,
+        lift_dlc = avg_dlc / global_means$g_dlc
+    ) %>%
+    left_join(semantic_table, by = "cluster_final")
+
+# 3. Generate "The Recipe" Cards
+for (i in 1:nrow(dna_cards)) {
+    row <- dna_cards[i, ]
+
+    # Descriptive Title (e.g., Cluster 1: The [TopTerm] Experience)
+    first_term <- str_split(row$top_terms, ",")[[1]][1] %>% str_to_title()
+    title <- sprintf("Cluster %s: The %s Experience", row$cluster_final, first_term)
+
+    cat(sprintf("\n### %s\n\n", title))
+
+    cat("**La Receta del Desarrollador:**\n\n")
+    cat(sprintf("- **Concepto Clave**: %s\n", row$top_terms))
+    cat(sprintf("- **Infraestructura**: Windows: %.0f%% | Mac: %.0f%% | Linux: %.0f%%\n", row$pct_windows * 100, row$pct_mac * 100, row$pct_linux * 100))
+    cat(sprintf("- **Monetización**: Micropagos: %.0f%% | Versiones: %.2f\n", row$pct_micropayments * 100, row$avg_versions))
+    cat(sprintf("- **Complejidad (Tags)**: %.1f (Híbrido/Sencillo)\n", row$avg_tag_complexity))
+
+    cat("\n**Requisitos Técnicos (Benchmarks):**\n")
+    cat(sprintf("- **Idiomas**: Lanzar en %.1f (x%.2f vs Global)\n", row$avg_languages, row$lift_lang))
+    cat(sprintf("- **Imágenes**: %.0f Screenshots (x%.2f)\n", row$avg_screenshots, row$lift_screens))
+
+    cat("\n**Contenido Sensible:**\n")
+    cat(sprintf("- Violencia: %.0f%% | Terror: %.0f%% | Nudity: %.0f%%\n", row$pct_violence * 100, row$pct_horror * 100, row$pct_nudity * 100))
+
+    cat("---\n")
+}
+```
+
+**Explanation:**  
+This section generates the "Developer Manual". We join the Numeric Profile with the Semantic keywords. Then, we iterate through each cluster and print a formatted "Recipe Card".
+*   **Concept**: What is the theme?
+*   **Infrastructure**: What platforms are required?
+*   **Benchmarks**: How many languages/screenshots are needed to compete?
+
+**Result:**  
+A set of human-readable "One-Pagers" for a Game Designer to understand exactly what to build to fit into that cluster.
+
+## 6. Matriz de Diferenciación (Champions)
+
+```{r differentiation_matrix, results='asis', fig.width=20}
+# Create the Differentiation Matrix
+champion_matrix <- dna_cards %>%
+    select(
+        Cluster = cluster_final,
+        `Key Term` = top_terms,
+        `Lang (Lift)` = lift_lang,
+        `Screens (Lift)` = lift_screens,
+        `% Violence` = pct_violence,
+        `% Nudity` = pct_nudity,
+        `% Micropagos` = pct_micropayments,
+        `% Linux` = pct_linux,
+        `% Windows` = pct_windows,
+        `% Mac` = pct_mac,
+        `Avg DLC` = avg_dlc,
+        `Avg Achievements` = avg_achievements,
+        `Avg Languages` = avg_languages,
+        `Avg Screenshots` = avg_screenshots,
+        `Avg Versions` = avg_versions,
+        `Avg Subscriptions` = avg_subscriptions,
+        `Avg Tag Complexity` = avg_tag_complexity,
+        `Pct Single Player` = pct_single_player
+    )
+
+# Function to bold the max value in a numeric column
+bold_max <- function(x) {
+    if (!is.numeric(x)) {
+        return(x)
+    }
+    max_val <- max(x, na.rm = TRUE)
+    # Markdown bold for max, rounded to 2 decimals
+    ifelse(x == max_val, paste0("**", round(x, 2), "**"), round(x, 2))
+}
+
+# Apply bolding to numeric columns
+champion_table <- champion_matrix %>%
+    mutate(across(where(is.numeric), bold_max)) %>%
+    # Clean up the Key Term to just top 1 for the table to save space
+    mutate(`Key Term` = word(`Key Term`, 1, sep = ","))
+
+knitr::kable(champion_table, caption = "Matriz de Diferenciación (Champions)")
+```
