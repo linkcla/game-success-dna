@@ -1,7 +1,9 @@
 # What determines the success of a game?
 
 **Course**: 21746 - Data Mining - Research Project
+
 **Institution**: Universitat de les Illes Balears
+
 **Authors**: Antonio Contestí Coll, Josep Ferriol Font, Francesc Gayà Piña, Carlos Gálvez Mena, Jordi Vanyó Mestre, Marc Link Cladera
 
 ## Project Overview
